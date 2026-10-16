@@ -26,7 +26,7 @@ var (
 	pollEvery  = 3 * time.Second
 	pollFor    = 4 * time.Minute
 	labKeyRE   = regexp.MustCompile(`^[\w-]+/[\w-]+$`)
-	safePathRE = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.\-]*(/[A-Za-z0-9_][A-Za-z0-9_.\-]*){0,3}$`)
+	safePathRE = regexp.MustCompile(`^\.?[A-Za-z0-9_][A-Za-z0-9_.\-]*(/\.?[A-Za-z0-9_][A-Za-z0-9_.\-]*){0,3}$`) // allows .github/workflows/ci.yml; ".." never matches
 )
 
 func envOr(k, d string) string {
@@ -251,10 +251,59 @@ func readMarker() (local, error) {
 
 // ---------- test (local, visible tests only) ----------
 
+// family looks at the file names gonomicon fetch wrote into this folder and
+// guesses which language the lab is in, the same way the grader does
+// server-side (see detectFamily in gonomicon-grader/run.mjs) — purely by
+// extension/naming convention, so this needs no change every time a new
+// track or language is added.
+func family() string {
+	entries, _ := os.ReadDir(".")
+	has := func(suffix string) bool {
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), suffix) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has("_test.go"):
+		return "go"
+	case has(".c"), has(".h"):
+		return "c"
+	case has("Test.php"):
+		return "php"
+	case has(".py"):
+		return "py"
+	case has(".test.ts"), has(".test.tsx"), has(".test.js"), has(".test.jsx"):
+		return "js"
+	default:
+		return "go"
+	}
+}
+
 func localTest() error {
 	if _, err := readMarker(); err != nil {
 		return err
 	}
+	switch family() {
+	case "go":
+		return localTestGo()
+	case "js":
+		return localTestCmd("npx", []string{"vitest", "run"}, "Node.js (with npm)", "https://nodejs.org")
+	case "py":
+		return localTestPython()
+	case "php":
+		return localTestPhp()
+	case "c":
+		return localTestC()
+	default:
+		fmt.Println("Couldn't tell what language this lab is from its files. Submit to find out: gonomicon submit")
+		return nil
+	}
+}
+
+func localTestGo() error {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		fmt.Println("Go is not installed on this computer yet, so the local test can't run.")
@@ -265,6 +314,121 @@ func localTest() error {
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		return errors.New("the visible test did not pass yet")
+	}
+	fmt.Println("Visible test passed. Submit to run the hidden checks: gonomicon submit")
+	return nil
+}
+
+// localTestCmd runs one local command (its own toolchain's own test runner)
+// and reports pass/fail the same way localTestGo does. Used by every
+// non-Go, non-C family, since each of those just needs "run the right test
+// command" rather than Go's own build step.
+func localTestCmd(binName string, args []string, needLabel, installURL string) error {
+	bin, err := exec.LookPath(binName)
+	if err != nil {
+		fmt.Printf("%s is not installed on this computer yet, so the local test can't run.\n", needLabel)
+		fmt.Printf("Install it from %s, or just check your work: gonomicon submit\n", installURL)
+		return nil
+	}
+	cmd := exec.Command(bin, args...)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return errors.New("the visible test did not pass yet")
+	}
+	fmt.Println("Visible test passed. Submit to run the hidden checks: gonomicon submit")
+	return nil
+}
+
+func localTestPython() error {
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		py, err = exec.LookPath("python")
+	}
+	if err != nil {
+		fmt.Println("Python is not installed on this computer yet, so the local test can't run.")
+		fmt.Println("Install it from https://python.org, or just check your work: gonomicon submit")
+		return nil
+	}
+	cmd := exec.Command(py, "-m", "pytest", "-q")
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		if strings.Contains(err.Error(), "exit status 1") {
+			return errors.New("the visible test did not pass yet")
+		}
+		fmt.Println("pytest isn't installed for this Python. Run: " + py + " -m pip install pytest")
+		fmt.Println("Or just check your work: gonomicon submit")
+		return nil
+	}
+	fmt.Println("Visible test passed. Submit to run the hidden checks: gonomicon submit")
+	return nil
+}
+
+func localTestPhp() error {
+	pest := filepath.Join("vendor", "bin", "pest")
+	if _, err := os.Stat(pest); err != nil {
+		fmt.Println("Pest isn't installed in this folder yet, so the local test can't run.")
+		fmt.Println("Run: composer require --dev pestphp/pest && vendor/bin/pest --init")
+		fmt.Println("Or just check your work: gonomicon submit")
+		return nil
+	}
+	php, err := exec.LookPath("php")
+	if err != nil {
+		fmt.Println("PHP is not installed on this computer yet, so the local test can't run.")
+		fmt.Println("Install it from https://php.net, or just check your work: gonomicon submit")
+		return nil
+	}
+	cmd := exec.Command(php, pest)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return errors.New("the visible test did not pass yet")
+	}
+	fmt.Println("Visible test passed. Submit to run the hidden checks: gonomicon submit")
+	return nil
+}
+
+func localTestC() error {
+	cc, err := exec.LookPath("gcc")
+	if err != nil {
+		cc, err = exec.LookPath("clang")
+	}
+	if err != nil {
+		fmt.Println("No C compiler (gcc or clang) found on this computer, so the local test can't run.")
+		fmt.Println("Install one, or just check your work: gonomicon submit")
+		return nil
+	}
+	entries, _ := os.ReadDir(".")
+	var cFiles []string
+	var visTest string
+	for _, e := range entries {
+		n := e.Name()
+		if !strings.HasSuffix(n, ".c") {
+			continue
+		}
+		if strings.HasPrefix(n, "test_") {
+			visTest = n
+			continue
+		}
+		if strings.HasPrefix(n, "hidden_test_") {
+			continue // hidden test is never run locally — it's never fetched
+		}
+		cFiles = append(cFiles, n)
+	}
+	if visTest == "" {
+		fmt.Println("Couldn't find this lab's visible test file. Submit to check your work: gonomicon submit")
+		return nil
+	}
+	bin := filepath.Join(os.TempDir(), "gonomicon-local-test")
+	args := append([]string{"-std=c17", "-Wall", "-Wextra", "-fsanitize=address,undefined", "-g", visTest}, cFiles...)
+	args = append(args, "-o", bin, "-lpthread")
+	build := exec.Command(cc, args...)
+	build.Stdout, build.Stderr = os.Stdout, os.Stderr
+	if err := build.Run(); err != nil {
+		return errors.New("your code did not compile")
+	}
+	run := exec.Command(bin)
+	run.Stdout, run.Stderr = os.Stdout, os.Stderr
+	if err := run.Run(); err != nil {
+		return errors.New("the visible test did not pass yet (or a sanitizer caught a bug — read the output above)")
 	}
 	fmt.Println("Visible test passed. Submit to run the hidden checks: gonomicon submit")
 	return nil
